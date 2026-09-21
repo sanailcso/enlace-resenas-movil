@@ -1,0 +1,10 @@
+{
+  "name": "Reseña directa",
+  "short_name": "Reseña NFC",
+  "description": "Genera enlaces directos para reseñas de Google.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#07090d",
+  "theme_color": "#07090d",
+  "icons": [{ "src": "/favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
+}
