@@ -9,6 +9,15 @@ const GOOGLE_HEADERS = {
   "Cookie": "CONSENT=YES+",
 };
 
+type Source = "place-id" | "maps-url" | "short-code" | "name";
+
+type ReviewCandidate = {
+  placeId: string;
+  reviewUrl: string;
+  name: string;
+  address?: string;
+};
+
 export const runtime = "edge";
 
 function json(body: unknown, status = 200) {
@@ -48,6 +57,58 @@ function extractPlaceId(text: string) {
   return pair ? placeIdFromHexPair(pair[1], pair[2]) : null;
 }
 
+function findPlaceId(value: unknown): string | null {
+  if (typeof value === "string") return value.match(PLACE_ID_RE)?.[1] ?? null;
+  if (!Array.isArray(value)) return null;
+  for (const item of value) {
+    const placeId = findPlaceId(item);
+    if (placeId) return placeId;
+  }
+  return null;
+}
+
+function collectCandidates(value: unknown, results: ReviewCandidate[] = []) {
+  if (!Array.isArray(value)) return results;
+
+  const hexPair = typeof value[10] === "string" ? value[10].match(HEX_PAIR_RE) : null;
+  const name = typeof value[11] === "string" ? value[11].trim() : "";
+  if (hexPair && name) {
+    const placeId = findPlaceId(value) ?? placeIdFromHexPair(hexPair[1], hexPair[2]);
+    const addressParts = Array.isArray(value[2])
+      ? value[2].filter((part): part is string => typeof part === "string" && Boolean(part.trim()))
+      : [];
+    const address = addressParts.join(", ");
+
+    if (!results.some((candidate) => candidate.placeId === placeId)) {
+      results.push({
+        placeId,
+        reviewUrl: REVIEW_PREFIX + placeId,
+        name,
+        ...(address ? { address } : {}),
+      });
+    }
+  }
+
+  for (const item of value) collectCandidates(item, results);
+  return results;
+}
+
+function parseMapCandidates(text: string) {
+  const trimmed = text.replace(/^\)\]\}'\s*/, "");
+  try {
+    return collectCandidates(JSON.parse(trimmed)).slice(0, 8);
+  } catch {
+    return [];
+  }
+}
+
+function nameFromMapsUrl(url: URL) {
+  const match = decodeText(url.pathname).match(/\/place\/([^/]+)/i);
+  if (!match) return null;
+  const name = match[1].replace(/\+/g, " ").trim();
+  return name && !/^0x[\da-f]+:/i.test(name) ? name : null;
+}
+
 function isAllowedGoogleHost(hostname: string) {
   const host = hostname.toLowerCase();
   return host === "google.com" || host.endsWith(".google.com") || host === "goo.gl" || host.endsWith(".goo.gl") || host === "g.page";
@@ -59,14 +120,18 @@ function safeUrl(raw: string) {
   return url;
 }
 
-async function inspectCandidate(start: string) {
+async function inspectCandidate(start: string, fallbackName?: string) {
   let current = safeUrl(start);
   const observed: string[] = [];
+  let discoveredName = nameFromMapsUrl(current);
 
   for (let hop = 0; hop <= 10; hop += 1) {
     observed.push(current.href);
+    discoveredName ||= nameFromMapsUrl(current);
     const fromUrl = extractPlaceId(current.href);
-    if (fromUrl) return fromUrl;
+    if (fromUrl && discoveredName) {
+      return [{ placeId: fromUrl, reviewUrl: REVIEW_PREFIX + fromUrl, name: discoveredName }];
+    }
 
     if (current.hostname === "consent.google.com") {
       const continuation = current.searchParams.get("continue");
@@ -93,24 +158,63 @@ async function inspectCandidate(start: string) {
     }
 
     const body = await response.text();
-    const fromBody = extractPlaceId(body);
-    if (fromBody) return fromBody;
+    const parsed = parseMapCandidates(body);
+    if (parsed.length) return parsed;
 
     const mapDataLink = body.match(/href="([^"]*tbm=map[^"]*)"/i)?.[1];
     if (mapDataLink) {
       try {
         const mapDataUrl = safeUrl(new URL(mapDataLink.replace(/&amp;/g, "&"), current).href);
         const mapDataResponse = await fetch(mapDataUrl.href, { headers: GOOGLE_HEADERS });
-        const fromMapData = extractPlaceId(await mapDataResponse.text());
-        if (fromMapData) return fromMapData;
+        const mapDataBody = await mapDataResponse.text();
+        const mapCandidates = parseMapCandidates(mapDataBody);
+        if (mapCandidates.length) return mapCandidates;
+        const fromMapData = extractPlaceId(mapDataBody);
+        if (fromMapData) {
+          return [{
+            placeId: fromMapData,
+            reviewUrl: REVIEW_PREFIX + fromMapData,
+            name: discoveredName ?? fallbackName ?? "Empresa de Google Maps",
+          }];
+        }
       } catch {
         // Continúa con el mensaje de ayuda si Google no ofrece datos de mapa.
       }
     }
+
+    const fromBody = extractPlaceId(body);
+    if (fromBody) {
+      return [{
+        placeId: fromBody,
+        reviewUrl: REVIEW_PREFIX + fromBody,
+        name: discoveredName ?? fallbackName ?? "Empresa de Google Maps",
+      }];
+    }
     break;
   }
 
-  return extractPlaceId(observed.join("\n"));
+  const placeId = extractPlaceId(observed.join("\n"));
+  return placeId
+    ? [{ placeId, reviewUrl: REVIEW_PREFIX + placeId, name: discoveredName ?? fallbackName ?? "Empresa de Google Maps" }]
+    : [];
+}
+
+async function searchNameCandidates(query: string) {
+  const searchUrl = safeUrl(`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(query)}`);
+  try {
+    const response = await fetch(searchUrl.href, { headers: GOOGLE_HEADERS });
+    const body = await response.text();
+    const directCandidates = parseMapCandidates(body);
+    if (directCandidates.length) return directCandidates;
+
+    const mapDataLink = body.match(/href="([^"]*tbm=map[^"]*)"/i)?.[1];
+    if (!mapDataLink) return [];
+    const mapDataUrl = safeUrl(new URL(mapDataLink.replace(/&amp;/g, "&"), response.url).href);
+    const mapDataResponse = await fetch(mapDataUrl.href, { headers: GOOGLE_HEADERS });
+    return parseMapCandidates(await mapDataResponse.text());
+  } catch {
+    return [];
+  }
 }
 
 function classifyInput(value: string) {
@@ -124,7 +228,7 @@ function classifyInput(value: string) {
   const query = encodeURIComponent(value);
   return {
     source: "name" as const,
-    candidates: [`https://www.google.com/maps/search/?api=1&ucbcb=1&query=${query}`, `https://www.google.com/maps?ucbcb=1&q=${query}`],
+    candidates: [`https://www.google.com/maps/search/?api=1&query=${query}`, `https://www.google.com/maps?q=${query}`],
   };
 }
 
@@ -141,13 +245,26 @@ export async function POST(request: Request) {
   if (input.length > MAX_INPUT) return json({ error: "La entrada es demasiado larga." }, 400);
 
   const direct = extractPlaceId(input);
-  if (direct) return json({ placeId: direct, reviewUrl: REVIEW_PREFIX + direct, source: "place-id" });
+  if (direct) {
+    const matches = await inspectCandidate(
+      `https://www.google.com/maps/place/?q=place_id:${encodeURIComponent(direct)}`,
+      "Empresa de Google Maps",
+    );
+    const candidates = matches.length
+      ? matches
+      : [{ placeId: direct, reviewUrl: REVIEW_PREFIX + direct, name: "Empresa de Google Maps" }];
+    return json({ source: "place-id" satisfies Source, candidates });
+  }
 
   try {
     const { source, candidates } = classifyInput(input);
+    if (source === "name") {
+      const matches = await searchNameCandidates(input);
+      if (matches.length) return json({ source, candidates: matches });
+    }
     for (const candidate of candidates) {
-      const placeId = await inspectCandidate(candidate);
-      if (placeId) return json({ placeId, reviewUrl: REVIEW_PREFIX + placeId, source });
+      const matches = await inspectCandidate(candidate, source === "name" ? input : undefined);
+      if (matches.length) return json({ source, candidates: matches });
     }
 
     const error = source === "short-code"

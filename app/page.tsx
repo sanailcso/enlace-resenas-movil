@@ -1,14 +1,21 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
-import { Check, Clipboard, Link2, LoaderCircle, Nfc, Sparkles } from "lucide-react";
+import { Check, Clipboard, Link2, LoaderCircle, MapPin, Nfc, Sparkles } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 
 type ReviewResult = {
   placeId: string;
   reviewUrl: string;
+  name: string;
+  address?: string;
+};
+
+type ResolveResponse = {
   source: "place-id" | "maps-url" | "short-code" | "name";
+  candidates: ReviewResult[];
+  error?: string;
 };
 
 async function copyText(value: string) {
@@ -29,6 +36,7 @@ async function copyText(value: string) {
 export default function Home() {
   const [input, setInput] = useState("");
   const [result, setResult] = useState<ReviewResult | null>(null);
+  const [candidates, setCandidates] = useState<ReviewResult[]>([]);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -54,6 +62,7 @@ export default function Home() {
     setLoading(true);
     setError("");
     setResult(null);
+    setCandidates([]);
     setCopied(false);
 
     try {
@@ -62,10 +71,16 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ input: value }),
       });
-      const payload = await response.json() as ReviewResult & { error?: string };
+      const payload = await response.json() as ResolveResponse;
       if (!response.ok) throw new Error(payload.error || "No se pudo crear el enlace.");
 
-      const nextResult: ReviewResult = payload;
+      if (!payload.candidates?.length) throw new Error("Google no devolvió ninguna empresa.");
+      if (payload.candidates.length > 1) {
+        setCandidates(payload.candidates);
+        return null;
+      }
+
+      const nextResult = payload.candidates[0];
       setResult(nextResult);
       try {
         await copyText(nextResult.reviewUrl);
@@ -91,6 +106,18 @@ export default function Home() {
     if (!result) return;
     try {
       await copyText(result.reviewUrl);
+      showCopied();
+    } catch {
+      setError("Tu navegador no permitió copiar. Mantén pulsado el enlace para copiarlo.");
+    }
+  }
+
+  async function selectCandidate(candidate: ReviewResult) {
+    setResult(candidate);
+    setCandidates([]);
+    setError("");
+    try {
+      await copyText(candidate.reviewUrl);
       showCopied();
     } catch {
       setError("Tu navegador no permitió copiar. Mantén pulsado el enlace para copiarlo.");
@@ -125,7 +152,7 @@ export default function Home() {
           : "";
         setInput(value);
         const generated = await generate(value);
-        if (!generated) throw new Error("No se pudo generar el enlace.");
+        if (!generated) return { candidates: "La página muestra las empresas encontradas para que el usuario elija la correcta." };
         return generated;
       },
     }, { signal: lifecycle.signal })).catch(() => undefined);
@@ -189,6 +216,33 @@ export default function Home() {
 
           <div aria-live="polite" aria-atomic="true">
             {error && <div className="mt-4 rounded-2xl border border-red-400/20 bg-red-400/10 px-4 py-3 text-sm leading-relaxed text-red-200">{error}</div>}
+            {candidates.length > 1 && (
+              <div className="mt-5 border-t border-white/10 pt-5">
+                <div className="mb-3">
+                  <p className="text-sm font-semibold text-white">Elige la empresa correcta</p>
+                  <p className="mt-1 text-xs leading-relaxed text-zinc-500">Google encontró varias coincidencias. Comprueba el nombre y la dirección antes de copiar.</p>
+                </div>
+                <div className="max-h-[25rem] space-y-2 overflow-y-auto pr-1">
+                  {candidates.map((candidate) => (
+                    <button
+                      key={candidate.placeId}
+                      type="button"
+                      onClick={() => void selectCandidate(candidate)}
+                      className="group w-full rounded-2xl border border-white/10 bg-black/25 p-4 text-left transition-colors hover:border-primary/40 hover:bg-primary/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60"
+                    >
+                      <span className="block text-sm font-semibold leading-snug text-white group-hover:text-primary">{candidate.name}</span>
+                      {candidate.address && (
+                        <span className="mt-1.5 flex items-start gap-1.5 text-xs leading-relaxed text-zinc-500">
+                          <MapPin className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                          {candidate.address}
+                        </span>
+                      )}
+                      <span className="mt-3 block text-xs font-semibold text-primary">Elegir y copiar enlace</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
             {result && (
               <div className="mt-5 border-t border-white/10 pt-5">
                 <div className="mb-3 flex items-center justify-between gap-3">
@@ -197,6 +251,15 @@ export default function Home() {
                     Enlace preparado
                   </p>
                   {copied && <span className="text-xs font-semibold text-primary">Copiado</span>}
+                </div>
+                <div className="mb-3 rounded-2xl border border-primary/20 bg-primary/8 px-4 py-3">
+                  <p className="text-base font-semibold leading-snug text-white">{result.name}</p>
+                  {result.address && (
+                    <p className="mt-1 flex items-start gap-1.5 text-xs leading-relaxed text-zinc-400">
+                      <MapPin className="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary" aria-hidden="true" />
+                      {result.address}
+                    </p>
+                  )}
                 </div>
                 <button type="button" onClick={handleCopy} className="group flex w-full items-center gap-3 rounded-2xl border border-white/10 bg-black/25 p-3.5 text-left transition-colors hover:border-primary/35">
                   <span className="min-w-0 flex-1 break-all font-mono text-xs leading-relaxed text-zinc-300">{result.reviewUrl}</span>
